@@ -72,11 +72,10 @@ STATE_NAMES = (
     "Exhausted_LeaningFwd",
 )
 
-PROJECT_ROOT = Path(r"G:\VAM_Fresh\VAM-Animation-Generator")
 DEFAULT_MOCAP_DIR = Path(r"G:\VAM_Fresh\SavedMocaps")
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "behavior_model.json"
-DEFAULT_BODYAWARE_MODEL_PATH = PROJECT_ROOT / "models" / "body_awareness_model.json"
-DEFAULT_PRESET_DIR = PROJECT_ROOT / "presets"
+DEFAULT_MODEL_PATH = Path(r"G:\VAM_Fresh\behavior_model.json")
+DEFAULT_BODYAWARE_MODEL_PATH = Path(r"G:\VAM_Fresh\body_awareness_model.json")
+DEFAULT_PRESET_DIR = Path(r"G:\VAM_Fresh\Custom")
 
 LOCKED_EXTREMITIES = (
     "lKneeControl",
@@ -1457,7 +1456,95 @@ class DirectorApp:
                 base = Rotation.from_quat(np.tile(aq, (len(out["time"]), 1)))
                 delta = Rotation.from_quat(normalize_quat(np.asarray(out["rotations"][c], dtype=float)))
                 out["rotations"][c] = normalize_quat((base * delta).as_quat())
+        DirectorApp._stabilize_lower_body(out, anchor)
+        DirectorApp._solve_leg_rotations_from_chain(out, anchor)
         return out
+
+    @staticmethod
+    def _stabilize_lower_body(out: dict[str, Any], anchor: dict[str, dict[str, Any]]) -> None:
+        """Clamp only extreme lower-body outliers; do not freeze normal motion."""
+        max_dev = {
+            "lFootControl": np.array([0.22, 0.20, 0.22], dtype=float),
+            "rFootControl": np.array([0.22, 0.20, 0.22], dtype=float),
+            "lKneeControl": np.array([0.20, 0.18, 0.20], dtype=float),
+            "rKneeControl": np.array([0.20, 0.18, 0.20], dtype=float),
+            "lThighControl": np.array([0.18, 0.16, 0.18], dtype=float),
+            "rThighControl": np.array([0.18, 0.16, 0.18], dtype=float),
+        }
+        for c, limit in max_dev.items():
+            if c not in out.get("positions", {}) or c not in anchor:
+                continue
+            ax = float(anchor[c].get("x", 0.0))
+            ay = float(anchor[c].get("y", 0.0))
+            az = float(anchor[c].get("z", 0.0))
+            x = np.asarray(out["positions"][c]["x"], dtype=float)
+            y = np.asarray(out["positions"][c]["y"], dtype=float)
+            z = np.asarray(out["positions"][c]["z"], dtype=float)
+            out["positions"][c]["x"] = ax + np.clip(x - ax, -limit[0], limit[0])
+            out["positions"][c]["y"] = ay + np.clip(y - ay, -limit[1], limit[1])
+            out["positions"][c]["z"] = az + np.clip(z - az, -limit[2], limit[2])
+
+    @staticmethod
+    def _solve_leg_rotations_from_chain(out: dict[str, Any], anchor: dict[str, dict[str, Any]]) -> None:
+        """Derive foot swing rotation from knee->foot vector to avoid twisted feet."""
+        for side in ("l", "r"):
+            knee = f"{side}KneeControl"
+            foot = f"{side}FootControl"
+            if knee not in out.get("positions", {}) or foot not in out.get("positions", {}):
+                continue
+            if knee not in anchor or foot not in anchor:
+                continue
+            base_k = np.array([anchor[knee]["x"], anchor[knee]["y"], anchor[knee]["z"]], dtype=float)
+            base_f = np.array([anchor[foot]["x"], anchor[foot]["y"], anchor[foot]["z"]], dtype=float)
+            base_vec = base_f - base_k
+            bn = float(np.linalg.norm(base_vec))
+            if bn <= 1e-8:
+                continue
+            base_dir = base_vec / bn
+            base_q = normalize_quat(np.asarray(anchor[foot].get("quat", [0.0, 0.0, 0.0, 1.0]), dtype=float))
+            n = len(out["time"])
+            solved = np.empty((n, 4), dtype=float)
+            for i in range(n):
+                cur_k = np.array(
+                    [
+                        out["positions"][knee]["x"][i],
+                        out["positions"][knee]["y"][i],
+                        out["positions"][knee]["z"][i],
+                    ],
+                    dtype=float,
+                )
+                cur_f = np.array(
+                    [
+                        out["positions"][foot]["x"][i],
+                        out["positions"][foot]["y"][i],
+                        out["positions"][foot]["z"][i],
+                    ],
+                    dtype=float,
+                )
+                cur_vec = cur_f - cur_k
+                cn = float(np.linalg.norm(cur_vec))
+                if cn <= 1e-8:
+                    solved[i] = base_q
+                    continue
+                cur_dir = cur_vec / cn
+                cross = np.cross(base_dir, cur_dir)
+                dot = float(np.clip(np.dot(base_dir, cur_dir), -1.0, 1.0))
+                c_norm = float(np.linalg.norm(cross))
+                if c_norm <= 1e-9:
+                    if dot < 0.0:
+                        # 180° fallback around stable axis.
+                        axis = np.array([0.0, 1.0, 0.0], dtype=float)
+                        if abs(np.dot(axis, base_dir)) > 0.9:
+                            axis = np.array([1.0, 0.0, 0.0], dtype=float)
+                        swing = Rotation.from_rotvec(axis * np.pi)
+                    else:
+                        swing = Rotation.identity()
+                else:
+                    axis = cross / c_norm
+                    angle = math.acos(dot)
+                    swing = Rotation.from_rotvec(axis * angle)
+                solved[i] = normalize_quat((swing * Rotation.from_quat(base_q)).as_quat())
+            out["rotations"][foot] = solved
 
     def _poll(self) -> None:
         try:
@@ -1487,7 +1574,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mocaps", type=Path, default=DEFAULT_MOCAP_DIR)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs" / "behavioral_generated_scene.json")
+    parser.add_argument("--output", type=Path, default=Path(r"G:\VAM_Fresh\behavioral_generated_scene.vamtline"))
     parser.add_argument("--pose", type=Path, default=None, help="Optional VaM pose JSON used as generation anchor")
     parser.add_argument("--context", default="Riding")
     parser.add_argument("--duration", type=float, default=120.0)

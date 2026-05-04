@@ -52,6 +52,9 @@ DEFAULT_CONTROLLERS = (
 )
 LEAD_CONTROLLERS = ("hipControl", "headControl")
 CURVE_KEYS = {"x": "X", "y": "Y", "z": "Z"}
+CONTROLLER_ALIASES = {
+    "pelvisControl": "hipControl",
+}
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,7 @@ class ClipData:
     duration: float
     serialize_version: int
     controllers: dict[str, ControllerTrack]
+    pose_anchor: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass
@@ -185,16 +189,18 @@ class TimelineParser:
         if not isinstance(controller_nodes, list):
             return None
 
+        pose_anchor = self._extract_pose_anchor(clip_json)
         tracks: dict[str, ControllerTrack] = {}
         for controller_json in controller_nodes:
             if not isinstance(controller_json, dict):
                 continue
             name = str(controller_json.get("Controller") or controller_json.get("id") or "")
-            if name not in self.controllers:
+            canonical = CONTROLLER_ALIASES.get(name, name)
+            if canonical not in self.controllers:
                 continue
-            track = self._parse_controller(name, controller_json, version)
+            track = self._parse_controller(canonical, controller_json, version)
             if track.has_position():
-                tracks[name] = track
+                tracks[canonical] = track
 
         if not tracks:
             LOGGER.info("No selected animated controllers in %s / %s", path.name, clip_name)
@@ -206,7 +212,34 @@ class TimelineParser:
             if valid_bounds:
                 duration = max(bound[1] for bound in valid_bounds)
 
-        return ClipData(path, clip_name, duration, version, tracks)
+        return ClipData(path, clip_name, duration, version, tracks, pose_anchor=pose_anchor)
+
+    def _extract_pose_anchor(self, clip_json: dict[str, Any]) -> dict[str, np.ndarray]:
+        """Extract per-controller anchor positions from embedded clip pose data."""
+        pose = clip_json.get("Pose")
+        if not isinstance(pose, dict):
+            return {}
+        storables = pose.get("storables")
+        if not isinstance(storables, list):
+            return {}
+        anchors: dict[str, np.ndarray] = {}
+        for node in storables:
+            if not isinstance(node, dict):
+                continue
+            sid = str(node.get("id") or "")
+            if not sid:
+                continue
+            canonical = CONTROLLER_ALIASES.get(sid, sid)
+            loc = node.get("localPosition")
+            if not isinstance(loc, dict):
+                loc = node.get("position")
+            if not isinstance(loc, dict):
+                continue
+            x = self._float_value(loc.get("x"), 0.0)
+            y = self._float_value(loc.get("y"), 0.0)
+            z = self._float_value(loc.get("z"), 0.0)
+            anchors[canonical] = np.array([x, y, z], dtype=float)
+        return anchors
 
     def _parse_controller(
         self, name: str, controller_json: dict[str, Any], version: int
