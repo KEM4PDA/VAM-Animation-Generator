@@ -26,6 +26,7 @@ try:
     from scipy.fft import rfft, rfftfreq
     from scipy.interpolate import CubicSpline, interp1d
     from scipy.signal import correlate, correlation_lags, find_peaks
+    from scipy.spatial.transform import Rotation, Slerp
 
     SCIPY_AVAILABLE = True
 except Exception:  # pragma: no cover - environment dependent
@@ -34,6 +35,8 @@ except Exception:  # pragma: no cover - environment dependent
     find_peaks = None
     correlate = None
     correlation_lags = None
+    Rotation = None
+    Slerp = None
     SCIPY_AVAILABLE = False
 
     from numpy.fft import rfft, rfftfreq
@@ -43,6 +46,7 @@ LOGGER = logging.getLogger("motion_analyzer")
 
 
 AXES = ("x", "y", "z")
+ROT_AXES = ("rot_x", "rot_y", "rot_z", "rot_w")
 DEFAULT_CONTROLLERS = (
     "hipControl",
     "chestControl",
@@ -52,6 +56,7 @@ DEFAULT_CONTROLLERS = (
 )
 LEAD_CONTROLLERS = ("hipControl", "headControl")
 CURVE_KEYS = {"x": "X", "y": "Y", "z": "Z"}
+ROT_CURVE_KEYS = {"rot_x": "RotX", "rot_y": "RotY", "rot_z": "RotZ", "rot_w": "RotW"}
 CONTROLLER_ALIASES = {
     "pelvisControl": "hipControl",
 }
@@ -77,6 +82,9 @@ class ControllerTrack:
         """Return True when all XYZ position curves contain useful data."""
 
         return all(len(self.curves.get(axis, [])) > 0 for axis in AXES)
+
+    def has_rotation(self) -> bool:
+        return all(len(self.curves.get(axis, [])) > 0 for axis in ROT_AXES)
 
     def time_bounds(self) -> tuple[float, float] | None:
         """Return min/max keyframe time across the position curves."""
@@ -246,6 +254,9 @@ class TimelineParser:
     ) -> ControllerTrack:
         curves: dict[str, list[Keyframe]] = {}
         for axis, timeline_key in CURVE_KEYS.items():
+            curve_node = controller_json.get(timeline_key)
+            curves[axis] = self._decode_curve(curve_node, version)
+        for axis, timeline_key in ROT_CURVE_KEYS.items():
             curve_node = controller_json.get(timeline_key)
             curves[axis] = self._decode_curve(curve_node, version)
         return ControllerTrack(name=name, curves=curves)
@@ -427,8 +438,20 @@ class MotionResampler:
                 values = self._resample_curve(track.curves.get(axis, []), time)
                 if values is not None:
                     columns[axis] = values
-            if len(columns) == 3:
-                signals[name] = pd.DataFrame(columns, index=pd.Index(time, name="time"))
+            quat = self._resample_quaternion(track, time)
+            if quat is None:
+                columns["rot_x"] = np.zeros_like(time, dtype=float)
+                columns["rot_y"] = np.zeros_like(time, dtype=float)
+                columns["rot_z"] = np.zeros_like(time, dtype=float)
+                columns["rot_w"] = np.ones_like(time, dtype=float)
+            else:
+                columns["rot_x"] = quat[:, 0]
+                columns["rot_y"] = quat[:, 1]
+                columns["rot_z"] = quat[:, 2]
+                columns["rot_w"] = quat[:, 3]
+            if not all(axis in columns for axis in AXES):
+                continue
+            signals[name] = pd.DataFrame(columns, index=pd.Index(time, name="time"))
 
         if not signals:
             return None
@@ -461,6 +484,55 @@ class MotionResampler:
             return np.asarray(interpolator(time), dtype=float)
 
         return np.interp(time, raw_t, raw_v, left=raw_v[0], right=raw_v[-1])
+
+    def _resample_quaternion(self, track: ControllerTrack, time: np.ndarray) -> np.ndarray | None:
+        frame_lists = [track.curves.get(axis, []) for axis in ROT_AXES]
+        if any(not lst for lst in frame_lists):
+            return None
+
+        per_axis: dict[str, dict[float, float]] = {}
+        for axis, frames in zip(ROT_AXES, frame_lists):
+            d: dict[float, float] = {}
+            for fr in frames:
+                d[float(fr.time)] = float(fr.value)
+            per_axis[axis] = d
+
+        common_t = sorted(set.intersection(*(set(d.keys()) for d in per_axis.values())))
+        if not common_t:
+            return None
+
+        t_src = np.asarray(common_t, dtype=float)
+        q_src = np.column_stack(
+            [
+                np.asarray([per_axis["rot_x"][t] for t in common_t], dtype=float),
+                np.asarray([per_axis["rot_y"][t] for t in common_t], dtype=float),
+                np.asarray([per_axis["rot_z"][t] for t in common_t], dtype=float),
+                np.asarray([per_axis["rot_w"][t] for t in common_t], dtype=float),
+            ]
+        )
+        q_src = self._normalize_quat(q_src)
+
+        if len(t_src) == 1:
+            return np.tile(q_src[0], (len(time), 1))
+
+        if SCIPY_AVAILABLE and Rotation is not None and Slerp is not None:
+            try:
+                slerp = Slerp(t_src, Rotation.from_quat(q_src))
+                q_out = slerp(time).as_quat()
+                return self._normalize_quat(q_out)
+            except Exception:
+                pass
+
+        # Fallback: linear blend per component + renormalization
+        q_out = np.column_stack([np.interp(time, t_src, q_src[:, i]) for i in range(4)])
+        return self._normalize_quat(q_out)
+
+    @staticmethod
+    def _normalize_quat(q: np.ndarray) -> np.ndarray:
+        q = np.asarray(q, dtype=float)
+        n = np.linalg.norm(q, axis=1, keepdims=True)
+        n[n <= 1e-12] = 1.0
+        return q / n
 
     @staticmethod
     def _max_track_time(clip: ClipData) -> float:
@@ -953,3 +1025,16 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = [
+    "TimelineParser",
+    "MotionResampler",
+    "FeatureExtractor",
+    "MotionClassifier",
+    "MotionGrammarExporter",
+    "ClipData",
+    "ResampledClip",
+    "ControllerTrack",
+    "Keyframe",
+]

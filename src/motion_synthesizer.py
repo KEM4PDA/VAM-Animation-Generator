@@ -8,60 +8,99 @@ from pathlib import Path
 class MocapSampler:
     """Lädt die rohen Mocap-Deltas aus der Motif-Datenbank."""
 
-    def __init__(self, model_data: Dict[str, Any]):
+    def __init__(self, model_data: Dict[str, Any], context_name: str | None = None):
         self.model = model_data
+        self.context_name = context_name
         self.motifs = model_data.get("motion_library", [])
         if not self.motifs:
-            self.motifs = self._build_from_motion_dictionary()
+            self.motifs = self._build_from_motion_dictionary(context_name)
+        elif context_name:
+            self.motifs = self._filter_motion_library_by_context(self.motifs, context_name)
 
-    def _build_from_motion_dictionary(self):
+    def _build_from_motion_dictionary(self, context_name: str | None):
         motifs = []
         contexts = self.model.get("contexts", {})
         if not isinstance(contexts, dict):
             return motifs
-        for ctx in contexts.values():
+        if context_name:
+            selected = self._resolve_context(context_name, contexts)
+            ctx_values = [contexts[selected]] if selected else []
+        else:
+            ctx_values = list(contexts.values())
+        for ctx in ctx_values:
             chunks = ctx.get("motion_dictionary", {}).get("chunks", [])
-            for ch in chunks:
-                motif = {}
-                hip = ch.get("hip_delta", {})
-                hx = hip.get("x", [])
-                hy = hip.get("y", [])
-                hz = hip.get("z", [])
-                if min(len(hx), len(hy), len(hz)) > 0:
-                    motif["hipControl"] = {
-                        "pos_x": hx,
-                        "pos_y": hy,
-                        "pos_z": hz,
-                        "rot_x": [0.0] * len(hx),
-                        "rot_y": [0.0] * len(hx),
-                        "rot_z": [0.0] * len(hx),
-                        "rot_w": [1.0] * len(hx),
+            motifs.extend(self._chunks_to_motifs(chunks))
+        return motifs
+
+    @staticmethod
+    def _norm(s: str) -> str:
+        return "".join(ch.lower() for ch in str(s) if ch.isalnum())
+
+    def _resolve_context(self, context_name: str, contexts: Dict[str, Any]) -> str | None:
+        if context_name in contexts:
+            return context_name
+        n = self._norm(context_name)
+        for key in contexts.keys():
+            nk = self._norm(key)
+            if n == nk or n in nk or nk in n:
+                return key
+        return None
+
+    def _filter_motion_library_by_context(self, motifs: list[Dict[str, Any]], context_name: str) -> list[Dict[str, Any]]:
+        n = self._norm(context_name)
+        out = []
+        for m in motifs:
+            mc = str(m.get("context") or m.get("source_context") or "")
+            if not mc:
+                continue
+            nm = self._norm(mc)
+            if n == nm or n in nm or nm in n:
+                out.append(m)
+        return out if out else motifs
+
+    def _chunks_to_motifs(self, chunks: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        motifs: list[Dict[str, Any]] = []
+        for ch in chunks:
+            motif: Dict[str, Any] = {}
+            hip = ch.get("hip_delta", {})
+            hx = hip.get("x", [])
+            hy = hip.get("y", [])
+            hz = hip.get("z", [])
+            if min(len(hx), len(hy), len(hz)) > 0:
+                motif["hipControl"] = {
+                    "pos_x": hx,
+                    "pos_y": hy,
+                    "pos_z": hz,
+                    "rot_x": [0.0] * len(hx),
+                    "rot_y": [0.0] * len(hx),
+                    "rot_z": [0.0] * len(hx),
+                    "rot_w": [1.0] * len(hx),
+                }
+            ctrls = ch.get("controllers", {})
+            if isinstance(ctrls, dict):
+                for ctrl, d in ctrls.items():
+                    if not isinstance(d, dict):
+                        continue
+                    px = d.get("x", [])
+                    py = d.get("y", [])
+                    pz = d.get("z", [])
+                    if min(len(px), len(py), len(pz)) <= 0:
+                        continue
+                    qx = d.get("qx", [0.0] * len(px))
+                    qy = d.get("qy", [0.0] * len(px))
+                    qz = d.get("qz", [0.0] * len(px))
+                    qw = d.get("qw", [1.0] * len(px))
+                    motif[ctrl] = {
+                        "pos_x": px,
+                        "pos_y": py,
+                        "pos_z": pz,
+                        "rot_x": qx,
+                        "rot_y": qy,
+                        "rot_z": qz,
+                        "rot_w": qw,
                     }
-                ctrls = ch.get("controllers", {})
-                if isinstance(ctrls, dict):
-                    for ctrl, d in ctrls.items():
-                        if not isinstance(d, dict):
-                            continue
-                        px = d.get("x", [])
-                        py = d.get("y", [])
-                        pz = d.get("z", [])
-                        if min(len(px), len(py), len(pz)) <= 0:
-                            continue
-                        qx = d.get("qx", [0.0] * len(px))
-                        qy = d.get("qy", [0.0] * len(px))
-                        qz = d.get("qz", [0.0] * len(px))
-                        qw = d.get("qw", [1.0] * len(px))
-                        motif[ctrl] = {
-                            "pos_x": px,
-                            "pos_y": py,
-                            "pos_z": pz,
-                            "rot_x": qx,
-                            "rot_y": qy,
-                            "rot_z": qz,
-                            "rot_w": qw,
-                        }
-                if motif:
-                    motifs.append(motif)
+            if motif:
+                motifs.append(motif)
         return motifs
 
     def get_random_chunk(self, controller: str):
@@ -78,7 +117,7 @@ class BehavioralSynthesizer:
     def __init__(self, model_path: str):
         with open(model_path, "r", encoding="utf-8") as f:
             self.model_data = json.load(f)
-        self.sampler = MocapSampler(self.model_data)
+        self.sampler = MocapSampler(self.model_data, context_name=None)
 
         self.keyframe_interval = 0.6
         self.base_anchor: Dict[str, Dict[str, float]] = {}
@@ -100,7 +139,8 @@ class BehavioralSynthesizer:
                 "z": float(data.get("z", 0.0)),
             }
 
-    def generate_session(self, duration: float, intensity: float, playfulness: float) -> Dict[str, Any]:
+    def generate_session(self, duration: float, intensity: float, playfulness: float, context: str | None = None) -> Dict[str, Any]:
+        self.sampler = MocapSampler(self.model_data, context_name=context)
         timeline = {}
         controllers = [
             "hipControl",

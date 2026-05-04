@@ -256,6 +256,7 @@ def _analyze_file_worker(path_str: str, fps: float) -> dict[str, Any]:
     parser = TimelineParser(KINEMATIC_CONTROLLERS)
     resampler = MotionResampler(fps=fps)
     path = Path(path_str)
+    context_hint = infer_context_label(path)
     clips_out: list[dict[str, Any]] = []
     phase_rows: list[dict[str, Any]] = []
     for clip in parser.parse_file(path):
@@ -310,6 +311,7 @@ def _analyze_file_worker(path_str: str, fps: float) -> dict[str, Any]:
                     "clip_name": clip.clip_name,
                     "duration_s": float((e - s) / fps),
                     "fps": float(fps),
+                    "context": context_hint,
                     "hip_delta": {
                         "x": seg[:, 0].astype(float).tolist(),
                         "y": seg[:, 1].astype(float).tolist(),
@@ -393,6 +395,7 @@ def _analyze_file_worker(path_str: str, fps: float) -> dict[str, Any]:
             {
                 "clip_name": clip.clip_name,
                 "source_file": path.name,
+                "context_hint": context_hint,
                 "anchor": anchor,
                 "bone_lengths": bone_lengths,
                 "hip_cycles": hip_cycles,
@@ -406,7 +409,7 @@ def _analyze_file_worker(path_str: str, fps: float) -> dict[str, Any]:
                 "motion_chunks": motion_chunks,
             }
         )
-    return {"file": path.name, "clips": clips_out, "phases": phase_rows}
+    return {"file": path.name, "file_path": str(path), "context_hint": context_hint, "clips": clips_out, "phases": phase_rows}
 
 
 def resolve_context(requested: str, available: list[str]) -> str:
@@ -422,6 +425,25 @@ def resolve_context(requested: str, available: list[str]) -> str:
         if r in cn or cn in r:
             return c
     raise KeyError(f"Unknown context '{requested}'. Available: {', '.join(available)}")
+
+
+def infer_context_label(path: Path, clip_name: str = "") -> str:
+    """Infer context from folder/file naming for strict data siloing."""
+    text = " ".join([str(path.parent.name), path.stem, clip_name]).lower()
+    token_map = {
+        "Cowgirl": ("cowgirl", "ride", "riding"),
+        "Missionary": ("missionary", "thrust"),
+        "Oral": ("blowjob", "oral", "bj"),
+        "Grinding": ("grind", "circular"),
+    }
+    for label, tokens in token_map.items():
+        if any(tok in text for tok in tokens):
+            return label
+    parent = path.parent.name.strip()
+    if parent and parent.lower() not in {"savedmocaps", "animations"}:
+        return parent
+    stem = path.stem.strip()
+    return stem.split("_")[0] if "_" in stem else stem
 
 
 class BehavioralFeatureExtractor:
@@ -457,13 +479,21 @@ class BehavioralFeatureExtractor:
         clips = [clip for res in results for clip in res.get("clips", [])]
         if not clips:
             raise RuntimeError("No usable mocap content found.")
-        context = self._build_context_from_worker_results(clips, [row for res in results for row in res.get("phases", [])])
+        context_to_clips: dict[str, list[dict[str, Any]]] = {}
+        for clip in clips:
+            label = str(clip.get("context_hint") or "Unsorted")
+            context_to_clips.setdefault(label, []).append(clip)
+        all_phase_rows = [row for res in results for row in res.get("phases", [])]
+        contexts_model: dict[str, Any] = {}
+        for label, cset in context_to_clips.items():
+            context = self._build_context_from_worker_results(cset, all_phase_rows)
+            contexts_model[label] = context
         all_chunks = [ch for c in clips for ch in c.get("motion_chunks", [])]
         model = {
             "version": 3,
             "sample_count": int(len(all_chunks)),
             "source_dir": str(self.mocap_dir),
-            "contexts": {"Riding / Cowgirl": context},
+            "contexts": contexts_model,
         }
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         with self.output_path.open("w", encoding="utf-8") as h:
@@ -1334,12 +1364,12 @@ class DirectorApp:
                 if not DEFAULT_BODYAWARE_MODEL_PATH.exists():
                     self.queue.put((0.05, "BodyAware scan startet (erstellt Modell)...", None))
                     BodyAwarenessScanner(fps=60.0, chunk_fps=15.0).learn(self.system.mocap_dir, DEFAULT_BODYAWARE_MODEL_PATH)
-                if self.system.model_path.exists():
-                    with self.system.model_path.open("r", encoding="utf-8") as h:
-                        classic = json.load(h)
-                    contexts = list(classic.get("contexts", {}).keys()) or ["Riding / Cowgirl"]
+                if DEFAULT_BODYAWARE_MODEL_PATH.exists():
+                    with DEFAULT_BODYAWARE_MODEL_PATH.open("r", encoding="utf-8") as h:
+                        bam = json.load(h)
+                    contexts = list(bam.get("contexts", {}).keys()) or ["Cowgirl"]
                 else:
-                    contexts = ["Riding / Cowgirl", "Missionary / Thrusting", "Grinding / Circular"]
+                    contexts = ["Cowgirl", "Missionary", "Oral", "Grinding"]
                 self.queue.put((1.0, "BodyAware model ready", {"contexts": contexts}))
             else:
                 model = self.system.load_or_learn(lambda v, m: self.queue.put((v, m, None)))
@@ -1360,12 +1390,12 @@ class DirectorApp:
                     self.system.mocap_dir,
                     DEFAULT_BODYAWARE_MODEL_PATH,
                 )
-                if self.system.model_path.exists():
-                    with self.system.model_path.open("r", encoding="utf-8") as h:
-                        classic = json.load(h)
-                    contexts = list(classic.get("contexts", {}).keys()) or ["Riding / Cowgirl"]
+                if DEFAULT_BODYAWARE_MODEL_PATH.exists():
+                    with DEFAULT_BODYAWARE_MODEL_PATH.open("r", encoding="utf-8") as h:
+                        bam = json.load(h)
+                    contexts = list(bam.get("contexts", {}).keys()) or ["Cowgirl"]
                 else:
-                    contexts = ["Riding / Cowgirl", "Missionary / Thrusting", "Grinding / Circular"]
+                    contexts = ["Cowgirl", "Missionary", "Oral", "Grinding"]
                 self.queue.put((1.0, "BodyAware model learned", {"contexts": contexts}))
             else:
                 model = self.system.learn(lambda v, m: self.queue.put((v, m, None)))
@@ -1428,7 +1458,7 @@ class DirectorApp:
                 playfulness = float(params.playfulness)
                 self.synthesizer.set_keyframe_interval_ms(keyframe_ms)
                 self.synthesizer.set_base_anchor(self.target_anchor)
-                timeline = self.synthesizer.generate_session(duration, intensity, playfulness)
+                timeline = self.synthesizer.generate_session(duration, intensity, playfulness, context=params.context)
                 self.synthesizer.export_vamtline(timeline, output_file)
             self.queue.put((1.0, f"Erfolg! Datei gespeichert unter: {output_file}", None))
         except Exception as exc:

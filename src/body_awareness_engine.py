@@ -54,6 +54,23 @@ WORLD_DELTA_CONTROLLERS = {
 }
 
 
+def _infer_context_from_path(path: Path) -> str:
+    text = f"{path.parent.name} {path.stem}".lower()
+    mapping = {
+        "Cowgirl": ("cowgirl", "riding", "ride"),
+        "Missionary": ("missionary", "thrust"),
+        "Oral": ("blowjob", "oral", "bj"),
+        "Grinding": ("grind", "circular"),
+    }
+    for label, toks in mapping.items():
+        if any(t in text for t in toks):
+            return label
+    parent = path.parent.name.strip()
+    if parent and parent.lower() not in {"savedmocaps", "animations"}:
+        return parent
+    return path.stem
+
+
 def _resample(seg: np.ndarray, n: int) -> np.ndarray:
     if seg.ndim == 1:
         seg = seg[:, None]
@@ -142,6 +159,7 @@ class BodyAwarenessScanner:
                     continue
                 sig = {c: rs.signals[c][list(AXES)].to_numpy(dtype=float) for c in rs.signals}
                 clip_durations.append(float(rs.time[-1] - rs.time[0]))
+                ctx_label = _infer_context_from_path(fp)
                 hip = sig["hipControl"]
                 pose_anchor = clip.pose_anchor or {}
                 hip0 = np.asarray(pose_anchor.get("hipControl", hip[0]), dtype=float).copy()
@@ -163,12 +181,17 @@ class BodyAwarenessScanner:
                     "source_file": fp.name,
                     "clip_name": clip.clip_name,
                     "duration_s": float(rs.time[-1] - rs.time[0]),
+                    "context": ctx_label,
                     "controllers": {
                         "hipControl": {
                             "space": "world_delta",
                             "pos_x": hip_full[:, 0].tolist(),
                             "pos_y": hip_full[:, 1].tolist(),
                             "pos_z": hip_full[:, 2].tolist(),
+                            "rot_x": np.asarray(rs.signals["hipControl"]["rot_x"], dtype=float).tolist(),
+                            "rot_y": np.asarray(rs.signals["hipControl"]["rot_y"], dtype=float).tolist(),
+                            "rot_z": np.asarray(rs.signals["hipControl"]["rot_z"], dtype=float).tolist(),
+                            "rot_w": np.asarray(rs.signals["hipControl"]["rot_w"], dtype=float).tolist(),
                         }
                     },
                 }
@@ -186,6 +209,10 @@ class BodyAwarenessScanner:
                         "pos_x": d_full[:, 0].tolist(),
                         "pos_y": d_full[:, 1].tolist(),
                         "pos_z": d_full[:, 2].tolist(),
+                        "rot_x": np.asarray(rs.signals[c]["rot_x"], dtype=float).tolist() if c in rs.signals else [0.0] * clip_n,
+                        "rot_y": np.asarray(rs.signals[c]["rot_y"], dtype=float).tolist() if c in rs.signals else [0.0] * clip_n,
+                        "rot_z": np.asarray(rs.signals[c]["rot_z"], dtype=float).tolist() if c in rs.signals else [0.0] * clip_n,
+                        "rot_w": np.asarray(rs.signals[c]["rot_w"], dtype=float).tolist() if c in rs.signals else [1.0] * clip_n,
                     }
                 cmeta = self._meta_for_segment(sig, 0, len(hip))
                 clip_entry["awareness"] = {
@@ -212,6 +239,7 @@ class BodyAwarenessScanner:
                     motif: dict[str, Any] = {
                         "id": f"{fp.name}:{clip.clip_name}:{chunk_id}",
                         "source_file": fp.name,
+                        "context": ctx_label,
                         "duration_s": float(d_s),
                         "posture": "neutral",
                     }
@@ -225,10 +253,10 @@ class BodyAwarenessScanner:
                         "pos_x": hip_rr[:, 0].tolist(),
                         "pos_y": hip_rr[:, 1].tolist(),
                         "pos_z": hip_rr[:, 2].tolist(),
-                        "rot_x": [0.0] * n,
-                        "rot_y": [0.0] * n,
-                        "rot_z": [0.0] * n,
-                        "rot_w": [1.0] * n,
+                        "rot_x": _resample(np.asarray(rs.signals["hipControl"]["rot_x"], dtype=float)[s:e], n).reshape(-1).tolist(),
+                        "rot_y": _resample(np.asarray(rs.signals["hipControl"]["rot_y"], dtype=float)[s:e], n).reshape(-1).tolist(),
+                        "rot_z": _resample(np.asarray(rs.signals["hipControl"]["rot_z"], dtype=float)[s:e], n).reshape(-1).tolist(),
+                        "rot_w": _resample(np.asarray(rs.signals["hipControl"]["rot_w"], dtype=float)[s:e], n).reshape(-1).tolist(),
                     }
 
                     for c in CTRL:
@@ -251,10 +279,10 @@ class BodyAwarenessScanner:
                             "pos_x": rr[:, 0].tolist(),
                             "pos_y": rr[:, 1].tolist(),
                             "pos_z": rr[:, 2].tolist(),
-                            "rot_x": [0.0] * n,
-                            "rot_y": [0.0] * n,
-                            "rot_z": [0.0] * n,
-                            "rot_w": [1.0] * n,
+                            "rot_x": _resample(np.asarray(rs.signals[c]["rot_x"], dtype=float)[s:e], n).reshape(-1).tolist() if c in rs.signals else [0.0] * n,
+                            "rot_y": _resample(np.asarray(rs.signals[c]["rot_y"], dtype=float)[s:e], n).reshape(-1).tolist() if c in rs.signals else [0.0] * n,
+                            "rot_z": _resample(np.asarray(rs.signals[c]["rot_z"], dtype=float)[s:e], n).reshape(-1).tolist() if c in rs.signals else [0.0] * n,
+                            "rot_w": _resample(np.asarray(rs.signals[c]["rot_w"], dtype=float)[s:e], n).reshape(-1).tolist() if c in rs.signals else [1.0] * n,
                         }
                     meta = self._meta_for_segment(sig, s, e)
                     motif["posture"] = meta.posture
@@ -274,7 +302,7 @@ class BodyAwarenessScanner:
                     model["motion_library"].append(motif)
 
         model["constraints"] = self._final_lengths(lengths)
-        model["contexts"] = self._build_contexts(model["motion_library"])
+        model["contexts"] = self._build_contexts_from_labels(model["motion_library"])
         model["motif_banks"] = self._build_motif_banks(model["motion_library"])
         model["neutral_anchor"] = self._build_neutral_anchor(anchors)
         model["analysis_report"] = {
@@ -427,41 +455,14 @@ class BodyAwarenessScanner:
         return banks
 
     @staticmethod
-    def _build_contexts(motion_library: list[dict[str, Any]]) -> dict[str, Any]:
+    def _build_contexts_from_labels(motion_library: list[dict[str, Any]]) -> dict[str, Any]:
         if not motion_library:
-            return {"neutral": {"chunk_ids": [], "count": 0}}
-        feats = []
-        ids = []
+            return {"Unsorted": {"chunk_ids": [], "count": 0}}
+        grouped: dict[str, list[str]] = {}
         for m in motion_library:
-            aw = m.get("awareness", {})
-            feats.append(
-                [
-                    float(aw.get("axis_x", 0.0)),
-                    float(aw.get("axis_y", 0.0)),
-                    float(aw.get("axis_z", 0.0)),
-                    float(aw.get("circularity_xz", 0.0)),
-                    float(aw.get("movement_energy", 0.0)),
-                    float(aw.get("knee_bend", 0.0)),
-                ]
-            )
-            ids.append(str(m.get("id")))
-        X = np.asarray(feats, dtype=float)
-        X = (X - np.mean(X, axis=0)) / np.maximum(np.std(X, axis=0), 1e-6)
-        k = int(np.clip(round(math.sqrt(len(motion_library) / 40.0)), 3, 8))
-        centers, labels = kmeans2(X, k, minit="points")
-        contexts: dict[str, dict[str, Any]] = {}
-        for ci in range(k):
-            chunk_ids = [ids[i] for i in range(len(ids)) if int(labels[i]) == ci]
-            c0 = centers[ci]
-            name = BodyAwarenessScanner._name_cluster(c0)
-            # Ensure unique names.
-            base = name
-            n = 2
-            while name in contexts:
-                name = f"{base}_{n}"
-                n += 1
-            contexts[name] = {"chunk_ids": chunk_ids, "count": len(chunk_ids), "center": c0.tolist()}
-        return contexts
+            label = str(m.get("context") or "Unsorted")
+            grouped.setdefault(label, []).append(str(m.get("id")))
+        return {k: {"chunk_ids": v, "count": len(v)} for k, v in grouped.items()}
 
     @staticmethod
     def _name_cluster(c: np.ndarray) -> str:
@@ -504,6 +505,8 @@ class BodyAwareSynthesizer:
         rot = {c: np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (n, 1)) for c in CTRL}
 
         if self.clip_library:
+            if context and not self._clip_pool(context):
+                raise RuntimeError(f"No clip data available for context '{context}'.")
             self._synthesize_from_clip_replay(pos, rot, n, context, blend_frames)
             self._inject_behavior_layers(pos, n, context)
             self._enforce_context_drive(pos, n, context)
@@ -512,6 +515,8 @@ class BodyAwareSynthesizer:
             return {"time": t, "positions": pos, "rotations": {k: _norm_quat(v) for k, v in rot.items()}}
 
         pool = self._context_pool(context)
+        if not pool:
+            raise RuntimeError(f"No motifs available for context '{context}'. Relearn with properly labeled data.")
         cur = 0
         prev: dict[str, np.ndarray] | None = None
         while cur < n:
@@ -652,6 +657,17 @@ class BodyAwareSynthesizer:
             pos["hipControl"]["x"][cur:end] = hip_r[:, 0]
             pos["hipControl"]["y"][cur:end] = hip_r[:, 1]
             pos["hipControl"]["z"][cur:end] = hip_r[:, 2]
+            hq = _norm_quat(
+                np.column_stack(
+                    [
+                        _resample(np.asarray(hip.get("rot_x", [0.0]), dtype=float), ln).reshape(-1),
+                        _resample(np.asarray(hip.get("rot_y", [0.0]), dtype=float), ln).reshape(-1),
+                        _resample(np.asarray(hip.get("rot_z", [0.0]), dtype=float), ln).reshape(-1),
+                        _resample(np.asarray(hip.get("rot_w", [1.0]), dtype=float), ln).reshape(-1),
+                    ]
+                )
+            )
+            rot["hipControl"][cur:end] = hq
             for c in CTRL:
                 if c == "hipControl":
                     continue
@@ -672,6 +688,17 @@ class BodyAwareSynthesizer:
                     pos[c]["x"][cur:end] = hip_r[:, 0] + rr[:, 0]
                     pos[c]["y"][cur:end] = hip_r[:, 1] + rr[:, 1]
                     pos[c]["z"][cur:end] = hip_r[:, 2] + rr[:, 2]
+                rq = _norm_quat(
+                    np.column_stack(
+                        [
+                            _resample(np.asarray(d.get("rot_x", [0.0]), dtype=float), ln).reshape(-1),
+                            _resample(np.asarray(d.get("rot_y", [0.0]), dtype=float), ln).reshape(-1),
+                            _resample(np.asarray(d.get("rot_z", [0.0]), dtype=float), ln).reshape(-1),
+                            _resample(np.asarray(d.get("rot_w", [1.0]), dtype=float), ln).reshape(-1),
+                        ]
+                    )
+                )
+                rot[c][cur:end] = rq
             # blend seam
             b = min(blend_frames, cur, ln - 1)
             if b > 0:
@@ -688,45 +715,30 @@ class BodyAwareSynthesizer:
     def _clip_pool(self, context: str | None) -> list[dict[str, Any]]:
         if not context:
             return self.clip_library
-        scored: list[tuple[float, dict[str, Any]]] = []
-        c = self._norm_text(context)
-        for cl in self.clip_library:
-            aw = cl.get("awareness", {})
-            axx = float(aw.get("axis_x", 0.0))
-            axy = float(aw.get("axis_y", 0.0))
-            axz = float(aw.get("axis_z", 0.0))
-            circ = float(aw.get("circularity_xz", 0.0))
-            hlc = float(aw.get("hip_leg_consistency", 0.0))
-            hhc = float(aw.get("hand_head_consistency", 0.0))
-            hact = float(aw.get("hand_activity", 0.0))
-            hdact = float(aw.get("head_activity", 0.0))
-            lbact = float(aw.get("lower_body_activity", 0.0))
-            s = hlc + hhc + 0.2 * hact + 0.2 * hdact + 0.15 * lbact
-            if "riding" in c or "cowgirl" in c:
-                ydom = axy / max(axx + axy + axz, 1e-8)
-                hpen = max(0.0, hdact - self.context_metric.get("head_q70", 0.08))
-                s += 2.6 * ydom + 0.6 * circ + 0.3 * lbact - 0.9 * hpen
-                # Hard reject head-dominant non-riding clips.
-                if axy < 0.045 or hdact > (1.75 * max(axy, 1e-5)):
-                    s -= 3.0
-            elif "missionary" in c or "thrust" in c:
-                s += 2.0 * (axz / max(axx + axy + axz, 1e-8))
-            scored.append((s, cl))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = [cl for _, cl in scored[: max(1, min(3, len(scored)))]]
-        return top if top else self.clip_library
+        direct = [cl for cl in self.clip_library if self._norm_text(cl.get("context", "")) == self._norm_text(context)]
+        if direct:
+            return direct
+        # strict siloing: no cross-context fallback
+        return []
 
     def _context_pool(self, context: str | None) -> list[dict[str, Any]]:
         if not context:
             return self.library
-        ctx = self.model.get("contexts", {}).get(context)
-        if ctx:
-            ids = ctx.get("chunk_ids", [])
+        contexts = self.model.get("contexts", {})
+        key = context if context in contexts else None
+        if key is None:
+            n = self._norm_text(context)
+            for k in contexts.keys():
+                if self._norm_text(k) == n:
+                    key = k
+                    break
+        if key:
+            ids = contexts.get(key, {}).get("chunk_ids", [])
             out = [self.by_id[i] for i in ids if i in self.by_id]
             if out:
                 return out
-        sem = self._semantic_filter(context)
-        return sem if sem else self.library
+        # strict siloing: no cross-context fallback
+        return []
 
     @staticmethod
     def _norm_text(s: str) -> str:
@@ -813,6 +825,7 @@ class BodyAwareSynthesizer:
     def _decode_motif(m: dict[str, Any]) -> dict[str, np.ndarray]:
         out: dict[str, Any] = {}
         spaces: dict[str, str] = {}
+        rots: dict[str, np.ndarray] = {}
         hip = m.get("hipControl")
         if hip:
             hx = np.asarray(hip.get("pos_x", [0.0]), dtype=float)
@@ -820,9 +833,15 @@ class BodyAwareSynthesizer:
             hz = np.asarray(hip.get("pos_z", [0.0]), dtype=float)
             out["hipControl"] = np.column_stack([hx, hy, hz])
             spaces["hipControl"] = str(hip.get("space", "world_delta"))
+            qx = np.asarray(hip.get("rot_x", [0.0] * len(hx)), dtype=float)
+            qy = np.asarray(hip.get("rot_y", [0.0] * len(hx)), dtype=float)
+            qz = np.asarray(hip.get("rot_z", [0.0] * len(hx)), dtype=float)
+            qw = np.asarray(hip.get("rot_w", [1.0] * len(hx)), dtype=float)
+            rots["hipControl"] = _norm_quat(np.column_stack([qx, qy, qz, qw]))
         else:
             out["hipControl"] = np.zeros((4, 3), dtype=float)
             spaces["hipControl"] = "world_delta"
+            rots["hipControl"] = np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (4, 1))
 
         for c in CTRL:
             if c == "hipControl":
@@ -831,6 +850,7 @@ class BodyAwareSynthesizer:
             if not d:
                 out[c] = np.zeros_like(out["hipControl"])
                 spaces[c] = "hip_local_delta"
+                rots[c] = np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (out["hipControl"].shape[0], 1))
                 continue
             px = np.asarray(d.get("pos_x", [0.0]), dtype=float)
             py = np.asarray(d.get("pos_y", [0.0]), dtype=float)
@@ -839,7 +859,13 @@ class BodyAwareSynthesizer:
             # keep local relation to hip; absolute reconstruction happens in paste.
             out[c] = rel
             spaces[c] = str(d.get("space", "hip_local_delta"))
+            qx = np.asarray(d.get("rot_x", [0.0] * len(px)), dtype=float)
+            qy = np.asarray(d.get("rot_y", [0.0] * len(px)), dtype=float)
+            qz = np.asarray(d.get("rot_z", [0.0] * len(px)), dtype=float)
+            qw = np.asarray(d.get("rot_w", [1.0] * len(px)), dtype=float)
+            rots[c] = _norm_quat(np.column_stack([qx, qy, qz, qw]))
         out["__space__"] = spaces
+        out["__rot__"] = rots
         return out
 
     def _paste(
@@ -868,10 +894,14 @@ class BodyAwareSynthesizer:
                 pos[c]["x"][s:e] = hip_r[:, 0] + r[:, 0]
                 pos[c]["y"][s:e] = hip_r[:, 1] + r[:, 1]
                 pos[c]["z"][s:e] = hip_r[:, 2] + r[:, 2]
+            rq = _resample(seg.get("__rot__", {}).get(c, np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (max(2, len(seg[c])), 1))), ln)
+            rot[c][s:e] = _norm_quat(rq)
         hip_r = _resample(seg["hipControl"], ln)
         pos["hipControl"]["x"][s:e] = hip_r[:, 0]
         pos["hipControl"]["y"][s:e] = hip_r[:, 1]
         pos["hipControl"]["z"][s:e] = hip_r[:, 2]
+        hq = _resample(seg.get("__rot__", {}).get("hipControl", np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (max(2, len(seg["hipControl"])), 1))), ln)
+        rot["hipControl"][s:e] = _norm_quat(hq)
         if b <= 0:
             return
         w = np.linspace(0.0, 1.0, b)
@@ -892,7 +922,7 @@ class BodyAwareSynthesizer:
                     new = r[src, k]
                     pos[c][a][dst] = (1.0 - w[i]) * old + w[i] * new
             q_old = _norm_quat(rot[c][s - b : s])
-            q_new = _norm_quat(np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (b, 1)))
+            q_new = _norm_quat(rot[c][s : s + b])
             for i in range(b):
                 rr = Rotation.from_quat(np.vstack([q_old[i], q_new[i]]))
                 rot[c][s - b + i] = Slerp([0.0, 1.0], rr)([w[i]])[0].as_quat()
@@ -922,7 +952,10 @@ class BodyAwareSynthesizer:
                 d = float(np.linalg.norm(hand - chest))
                 max_reach = 0.95
                 if d > max_reach and d > 1e-6:
-                    hand = chest + (hand - chest) * (max_reach / d)
+                    over = d - max_reach
+                    # soft compression to avoid visible snapping/teleporting
+                    scale = (max_reach + 0.35 * over) / d
+                    hand = chest + (hand - chest) * scale
                     pos[hand_name]["x"][i], pos[hand_name]["y"][i], pos[hand_name]["z"][i] = hand.tolist()
         for c in CTRL:
             for a in AXES:
