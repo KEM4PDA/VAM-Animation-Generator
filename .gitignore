@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local env/editor
+.venv/
+.idea/
+.vscode/
+
+# Large generated artifacts
+models/*.json
+models/*.csv
+outputs/**
+!outputs/.gitkeep
+outputs/tmp/**
+
+# Optional local logs
+*.log
+
